@@ -179,7 +179,7 @@ fn create_installer(
     let db = Database::open(&root.join("db/zb.sqlite3"))?;
 
     Ok(Installer::new(
-        api_client, blob_cache, store, cellar, linker, db, 8, None,
+        api_client, blob_cache, store, cellar, linker, db, 8,
     ))
 }
 

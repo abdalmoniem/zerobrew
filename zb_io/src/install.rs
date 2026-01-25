@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::api::ApiClient;
@@ -20,7 +20,6 @@ pub struct Installer {
     cellar: Cellar,
     linker: Linker,
     db: Database,
-    homebrew_cellar: Option<PathBuf>,
 }
 
 pub struct InstallPlan {
@@ -30,7 +29,6 @@ pub struct InstallPlan {
 
 pub struct ExecuteResult {
     pub installed: usize,
-    pub skipped_homebrew: Vec<String>,
 }
 
 /// Internal struct for tracking processed packages during streaming install
@@ -51,7 +49,6 @@ impl Installer {
         linker: Linker,
         db: Database,
         download_concurrency: usize,
-        homebrew_cellar: Option<PathBuf>,
     ) -> Self {
         Self {
             api_client,
@@ -60,17 +57,6 @@ impl Installer {
             cellar,
             linker,
             db,
-            homebrew_cellar,
-        }
-    }
-
-    /// Check if a package exists in Homebrew's Cellar (any version)
-    fn is_in_homebrew(&self, name: &str) -> bool {
-        if let Some(ref cellar_path) = self.homebrew_cellar {
-            let pkg_path = cellar_path.join(name);
-            pkg_path.exists() && pkg_path.is_dir()
-        } else {
-            false
         }
     }
 
@@ -170,29 +156,18 @@ impl Installer {
             }
         };
 
-        // Filter out packages already in Homebrew
-        let mut to_install: Vec<(Formula, SelectedBottle)> = Vec::new();
-        let mut skipped_homebrew: Vec<String> = Vec::new();
-
-        for (formula, bottle) in plan.formulas.into_iter().zip(plan.bottles.into_iter()) {
-            if self.is_in_homebrew(&formula.name) {
-                report(InstallProgress::Skipped {
-                    name: formula.name.clone(),
-                });
-                skipped_homebrew.push(formula.name.clone());
-            } else {
-                to_install.push((formula, bottle));
-            }
-        }
+        // Pair formulas with bottles
+        let to_install: Vec<(Formula, SelectedBottle)> = plan
+            .formulas
+            .into_iter()
+            .zip(plan.bottles.into_iter())
+            .collect();
 
         if to_install.is_empty() {
-            return Ok(ExecuteResult {
-                installed: 0,
-                skipped_homebrew,
-            });
+            return Ok(ExecuteResult { installed: 0 });
         }
 
-        // Download only the bottles we need
+        // Download all bottles
         let requests: Vec<DownloadRequest> = to_install
             .iter()
             .map(|(f, b)| DownloadRequest {
@@ -254,9 +229,10 @@ impl Installer {
                     };
 
                     // Materialize to cellar
+                    // Use effective_version() which includes rebuild suffix if applicable
                     let keg_path = match self.cellar.materialize(
                         &formula.name,
-                        &formula.versions.stable,
+                        &formula.effective_version(),
                         &store_entry,
                     ) {
                         Ok(path) => path,
@@ -293,7 +269,7 @@ impl Installer {
 
                     completed[idx] = Some(ProcessedPackage {
                         name: formula.name.clone(),
-                        version: formula.versions.stable.clone(),
+                        version: formula.effective_version(),
                         store_key: bottle.sha256.clone(),
                         linked_files,
                     });
@@ -328,7 +304,6 @@ impl Installer {
 
         Ok(ExecuteResult {
             installed: to_install.len(),
-            skipped_homebrew,
         })
     }
 
@@ -396,7 +371,6 @@ pub fn create_installer(
     root: &Path,
     prefix: &Path,
     download_concurrency: usize,
-    homebrew_cellar: Option<PathBuf>,
 ) -> Result<Installer, Error> {
     use std::fs;
 
@@ -450,7 +424,6 @@ pub fn create_installer(
         linker,
         db,
         download_concurrency,
-        homebrew_cellar,
     ))
 }
 
@@ -553,7 +526,7 @@ mod tests {
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
         let mut installer =
-            Installer::new(api_client, blob_cache, store, cellar, linker, db, 4, None);
+            Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
 
         // Install
         installer.install("testpkg", true).await.unwrap();
@@ -628,7 +601,7 @@ mod tests {
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
         let mut installer =
-            Installer::new(api_client, blob_cache, store, cellar, linker, db, 4, None);
+            Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
 
         // Install
         installer.install("uninstallme", true).await.unwrap();
@@ -703,7 +676,7 @@ mod tests {
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
         let mut installer =
-            Installer::new(api_client, blob_cache, store, cellar, linker, db, 4, None);
+            Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
 
         // Install and uninstall
         installer.install("gctest", true).await.unwrap();
@@ -781,7 +754,7 @@ mod tests {
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
         let mut installer =
-            Installer::new(api_client, blob_cache, store, cellar, linker, db, 4, None);
+            Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
 
         // Install but don't uninstall
         installer.install("keepme", true).await.unwrap();
@@ -888,7 +861,7 @@ mod tests {
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
         let mut installer =
-            Installer::new(api_client, blob_cache, store, cellar, linker, db, 4, None);
+            Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
 
         // Install main package (should also install dependency)
         installer.install("mainpkg", true).await.unwrap();
@@ -986,7 +959,7 @@ mod tests {
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
         let mut installer =
-            Installer::new(api_client, blob_cache, store, cellar, linker, db, 4, None);
+            Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
 
         // Install root (should install all 5 packages)
         installer.install("root", true).await.unwrap();
@@ -1071,7 +1044,7 @@ mod tests {
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
         let mut installer =
-            Installer::new(api_client, blob_cache, store, cellar, linker, db, 4, None);
+            Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
 
         // Install slow package (which depends on fast)
         // With streaming, fast should be extracted while slow is still downloading

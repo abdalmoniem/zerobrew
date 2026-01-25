@@ -127,7 +127,7 @@ mod tests {
             },
             dependencies: deps.iter().map(|dep| dep.to_string()).collect(),
             bottle: Bottle {
-                stable: BottleStable { files },
+                stable: BottleStable { files, rebuild: 0 },
             },
         }
     }

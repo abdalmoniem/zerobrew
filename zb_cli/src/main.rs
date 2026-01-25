@@ -3,6 +3,7 @@ use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -19,16 +20,12 @@ struct Cli {
     root: PathBuf,
 
     /// Prefix directory for linked binaries
-    #[arg(long, default_value = "/opt/homebrew")]
+    #[arg(long, default_value = "/opt/zerobrew/prefix")]
     prefix: PathBuf,
 
     /// Number of parallel downloads
     #[arg(long, default_value = "48")]
     concurrency: usize,
-
-    /// Homebrew Cellar path to reuse existing packages (set to empty to disable)
-    #[arg(long, default_value = "/opt/homebrew/Cellar")]
-    homebrew_cellar: PathBuf,
 
     #[command(subcommand)]
     command: Commands,
@@ -70,6 +67,9 @@ enum Commands {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+
+    /// Initialize zerobrew directories with correct permissions
+    Init,
 }
 
 #[tokio::main]
@@ -80,6 +80,202 @@ async fn main() {
         eprintln!("{} {}", style("error:").red().bold(), e);
         std::process::exit(1);
     }
+}
+
+/// Check if zerobrew directories need initialization
+fn needs_init(root: &PathBuf, prefix: &PathBuf) -> bool {
+    // Check if directories exist and are writable
+    let root_ok = root.exists() && is_writable(root);
+    let prefix_ok = prefix.exists() && is_writable(prefix);
+    !(root_ok && prefix_ok)
+}
+
+fn is_writable(path: &PathBuf) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    // Try to check if we can write to this directory
+    let test_file = path.join(".zb_write_test");
+    match std::fs::write(&test_file, b"test") {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&test_file);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Run initialization - create directories and set permissions
+fn run_init(root: &PathBuf, prefix: &PathBuf) -> Result<(), String> {
+    println!(
+        "{} Initializing zerobrew...",
+        style("==>").cyan().bold()
+    );
+
+    let dirs_to_create = vec![
+        root.clone(),
+        root.join("store"),
+        root.join("db"),
+        root.join("cache"),
+        root.join("locks"),
+        prefix.clone(),
+        prefix.join("bin"),
+        prefix.join("Cellar"),
+    ];
+
+    // Check if we need sudo
+    let need_sudo = dirs_to_create.iter().any(|d| {
+        if d.exists() {
+            !is_writable(d)
+        } else {
+            // Check parent
+            d.parent().map(|p| p.exists() && !is_writable(&p.to_path_buf())).unwrap_or(true)
+        }
+    });
+
+    if need_sudo {
+        println!(
+            "{}",
+            style("    Creating directories (requires sudo)...").dim()
+        );
+
+        // Create directories with sudo
+        for dir in &dirs_to_create {
+            let status = Command::new("sudo")
+                .args(["mkdir", "-p", &dir.to_string_lossy()])
+                .status()
+                .map_err(|e| format!("Failed to run sudo mkdir: {}", e))?;
+
+            if !status.success() {
+                return Err(format!("Failed to create directory: {}", dir.display()));
+            }
+        }
+
+        // Change ownership to current user
+        let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+        let status = Command::new("sudo")
+            .args(["chown", "-R", &user, &root.to_string_lossy()])
+            .status()
+            .map_err(|e| format!("Failed to run sudo chown: {}", e))?;
+
+        if !status.success() {
+            return Err(format!("Failed to set ownership on {}", root.display()));
+        }
+
+        let status = Command::new("sudo")
+            .args(["chown", "-R", &user, &prefix.to_string_lossy()])
+            .status()
+            .map_err(|e| format!("Failed to run sudo chown: {}", e))?;
+
+        if !status.success() {
+            return Err(format!("Failed to set ownership on {}", prefix.display()));
+        }
+    } else {
+        // Create directories without sudo
+        for dir in &dirs_to_create {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("Failed to create {}: {}", dir.display(), e))?;
+        }
+    }
+
+    // Add to shell config if not already there
+    add_to_path(prefix)?;
+
+    println!(
+        "{} Initialization complete!",
+        style("==>").cyan().bold()
+    );
+
+    Ok(())
+}
+
+fn add_to_path(prefix: &PathBuf) -> Result<(), String> {
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
+
+    let config_file = if shell.contains("zsh") {
+        format!("{}/.zshrc", home)
+    } else if shell.contains("bash") {
+        let bash_profile = format!("{}/.bash_profile", home);
+        if std::path::Path::new(&bash_profile).exists() {
+            bash_profile
+        } else {
+            format!("{}/.bashrc", home)
+        }
+    } else {
+        format!("{}/.profile", home)
+    };
+
+    let bin_path = prefix.join("bin");
+    let path_export = format!("export PATH=\"{}:$PATH\"", bin_path.display());
+
+    // Check if already in config
+    if let Ok(contents) = std::fs::read_to_string(&config_file) {
+        if contents.contains(&bin_path.to_string_lossy().to_string()) {
+            return Ok(());
+        }
+    }
+
+    // Append to config
+    let addition = format!("\n# zerobrew\n{}\n", path_export);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config_file)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(addition.as_bytes())
+        })
+        .map_err(|e| format!("Failed to update {}: {}", config_file, e))?;
+
+    println!(
+        "    {} Added {} to PATH in {}",
+        style("✓").green(),
+        bin_path.display(),
+        config_file
+    );
+    println!(
+        "    {} Run {} or restart your terminal",
+        style("→").cyan(),
+        style(format!("source {}", config_file)).cyan()
+    );
+
+    Ok(())
+}
+
+/// Ensure zerobrew is initialized, prompting user if needed
+fn ensure_init(root: &PathBuf, prefix: &PathBuf) -> Result<(), zb_core::Error> {
+    if !needs_init(root, prefix) {
+        return Ok(());
+    }
+
+    println!(
+        "{} Zerobrew needs to be initialized first.",
+        style("Note:").yellow().bold()
+    );
+    println!("    This will create directories at:");
+    println!("      • {}", root.display());
+    println!("      • {}", prefix.display());
+    println!();
+
+    print!("Initialize now? [Y/n] ");
+    use std::io::{self, Write};
+    io::stdout().flush().unwrap();
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    let input = input.trim();
+
+    if !input.is_empty() && !input.eq_ignore_ascii_case("y") && !input.eq_ignore_ascii_case("yes") {
+        return Err(zb_core::Error::StoreCorruption {
+            message: "Initialization required. Run 'zb init' first.".to_string(),
+        });
+    }
+
+    run_init(root, prefix).map_err(|e| zb_core::Error::StoreCorruption {
+        message: e,
+    })
 }
 
 fn suggest_homebrew(formula: &str, error: &zb_core::Error) {
@@ -99,18 +295,25 @@ fn suggest_homebrew(formula: &str, error: &zb_core::Error) {
 }
 
 async fn run(cli: Cli) -> Result<(), zb_core::Error> {
-    // Use homebrew cellar if it exists and path is non-empty
-    let homebrew_cellar = if cli.homebrew_cellar.as_os_str().is_empty() {
-        None
-    } else if cli.homebrew_cellar.exists() {
-        Some(cli.homebrew_cellar)
-    } else {
-        None
-    };
+    // Handle init separately - it doesn't need the installer
+    if matches!(cli.command, Commands::Init) {
+        return run_init(&cli.root, &cli.prefix).map_err(|e| zb_core::Error::StoreCorruption {
+            message: e,
+        });
+    }
 
-    let mut installer = create_installer(&cli.root, &cli.prefix, cli.concurrency, homebrew_cellar)?;
+    // For reset, handle specially since directories may not be writable
+    if matches!(cli.command, Commands::Reset { .. }) {
+        // Skip init check for reset
+    } else {
+        // Ensure initialized before other commands
+        ensure_init(&cli.root, &cli.prefix)?;
+    }
+
+    let mut installer = create_installer(&cli.root, &cli.prefix, cli.concurrency)?;
 
     match cli.command {
+        Commands::Init => unreachable!(), // Handled above
         Commands::Install { formula, no_link } => {
             let start = Instant::now();
             println!(
@@ -233,14 +436,6 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
                             pb.finish();
                         }
                     }
-                    InstallProgress::Skipped { name } => {
-                        let pb = multi_clone.add(ProgressBar::new_spinner());
-                        pb.set_style(done_style_clone.clone());
-                        pb.set_prefix(name.clone());
-                        pb.set_message(format!("{} skipped (in Homebrew)", style("○").dim()));
-                        pb.finish();
-                        bars.insert(name, pb);
-                    }
                 }
             }));
 
@@ -361,17 +556,18 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
         }
 
         Commands::Reset { yes } => {
-            if !cli.root.exists() {
-                println!("Nothing to reset - {} does not exist.", cli.root.display());
+            if !cli.root.exists() && !cli.prefix.exists() {
+                println!("Nothing to reset - directories do not exist.");
                 return Ok(());
             }
 
             if !yes {
                 println!(
-                    "{} This will delete all zerobrew data at {}",
-                    style("Warning:").yellow().bold(),
-                    style(cli.root.display()).cyan()
+                    "{} This will delete all zerobrew data at:",
+                    style("Warning:").yellow().bold()
                 );
+                println!("      • {}", cli.root.display());
+                println!("      • {}", cli.prefix.display());
                 print!("Continue? [y/N] ");
                 use std::io::{self, Write};
                 io::stdout().flush().unwrap();
@@ -384,30 +580,40 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
                 }
             }
 
-            println!(
-                "{} Removing {}...",
-                style("==>").cyan().bold(),
-                cli.root.display()
-            );
-            if let Err(e) = std::fs::remove_dir_all(&cli.root) {
-                eprintln!(
-                    "{} Failed to remove {}: {}",
-                    style("error:").red().bold(),
-                    cli.root.display(),
-                    e
-                );
-                let is_permission_error = e.kind() == std::io::ErrorKind::PermissionDenied
-                    || e.to_string().to_lowercase().contains("permission");
-                if is_permission_error {
-                    eprintln!();
-                    eprintln!("      Try running with sudo:");
-                    eprintln!(
-                        "      {}",
-                        style(format!("sudo rm -rf {}", cli.root.display())).cyan()
-                    );
+            // Remove directories - try without sudo first, then with
+            for dir in [&cli.root, &cli.prefix] {
+                if !dir.exists() {
+                    continue;
                 }
-                std::process::exit(1);
+
+                println!(
+                    "{} Removing {}...",
+                    style("==>").cyan().bold(),
+                    dir.display()
+                );
+
+                if std::fs::remove_dir_all(dir).is_err() {
+                    // Try with sudo
+                    let status = Command::new("sudo")
+                        .args(["rm", "-rf", &dir.to_string_lossy()])
+                        .status();
+
+                    if status.is_err() || !status.unwrap().success() {
+                        eprintln!(
+                            "{} Failed to remove {}",
+                            style("error:").red().bold(),
+                            dir.display()
+                        );
+                        std::process::exit(1);
+                    }
+                }
             }
+
+            // Re-initialize with correct permissions
+            run_init(&cli.root, &cli.prefix).map_err(|e| zb_core::Error::StoreCorruption {
+                message: e,
+            })?;
+
             println!(
                 "{} Reset complete. Ready for cold install.",
                 style("==>").cyan().bold()

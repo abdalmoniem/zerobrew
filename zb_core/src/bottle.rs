@@ -93,7 +93,7 @@ mod tests {
             },
             dependencies: Vec::new(),
             bottle: Bottle {
-                stable: BottleStable { files },
+                stable: BottleStable { files, rebuild: 0 },
             },
         };
 
@@ -121,7 +121,7 @@ mod tests {
             },
             dependencies: Vec::new(),
             bottle: Bottle {
-                stable: BottleStable { files },
+                stable: BottleStable { files, rebuild: 0 },
             },
         };
 

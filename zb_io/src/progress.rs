@@ -22,8 +22,6 @@ pub enum InstallProgress {
     LinkStarted { name: String },
     /// Linking completed for a package
     LinkCompleted { name: String },
-    /// Package skipped (already in Homebrew)
-    Skipped { name: String },
 }
 
 /// Callback type for progress reporting

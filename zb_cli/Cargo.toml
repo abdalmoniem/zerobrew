@@ -15,3 +15,6 @@ console = "0.15"
 
 zb_core = { path = "../zb_core" }
 zb_io = { path = "../zb_io" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

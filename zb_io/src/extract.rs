@@ -1,19 +1,87 @@
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 use flate2::read::GzDecoder;
 use tar::Archive;
+use xz2::read::XzDecoder;
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 use zb_core::Error;
 
-pub fn extract_tarball(tarball_path: &Path, dest_dir: &Path) -> Result<(), Error> {
-    let file = File::open(tarball_path).map_err(|e| Error::StoreCorruption {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompressionFormat {
+    Gzip,
+    Xz,
+    Zstd,
+    Unknown,
+}
+
+fn detect_compression(path: &Path) -> Result<CompressionFormat, Error> {
+    let mut file = File::open(path).map_err(|e| Error::StoreCorruption {
         message: format!("failed to open tarball: {e}"),
     })?;
 
-    let decoder = GzDecoder::new(file);
-    let mut archive = Archive::new(decoder);
+    let mut magic = [0u8; 6];
+    let bytes_read = file.read(&mut magic).map_err(|e| Error::StoreCorruption {
+        message: format!("failed to read magic bytes: {e}"),
+    })?;
+
+    if bytes_read < 2 {
+        return Ok(CompressionFormat::Unknown);
+    }
+
+    // Gzip: 1f 8b
+    if magic[0] == 0x1f && magic[1] == 0x8b {
+        return Ok(CompressionFormat::Gzip);
+    }
+
+    // XZ: fd 37 7a 58 5a 00 (FD 7zXZ\0)
+    if bytes_read >= 6 && magic[0..6] == [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00] {
+        return Ok(CompressionFormat::Xz);
+    }
+
+    // Zstd: 28 b5 2f fd
+    if bytes_read >= 4 && magic[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+        return Ok(CompressionFormat::Zstd);
+    }
+
+    Ok(CompressionFormat::Unknown)
+}
+
+pub fn extract_tarball(tarball_path: &Path, dest_dir: &Path) -> Result<(), Error> {
+    let format = detect_compression(tarball_path)?;
+
+    let file = File::open(tarball_path).map_err(|e| Error::StoreCorruption {
+        message: format!("failed to open tarball: {e}"),
+    })?;
+    let reader = BufReader::new(file);
+
+    match format {
+        CompressionFormat::Gzip => {
+            let decoder = GzDecoder::new(reader);
+            extract_tar_archive(decoder, dest_dir)
+        }
+        CompressionFormat::Xz => {
+            let decoder = XzDecoder::new(reader);
+            extract_tar_archive(decoder, dest_dir)
+        }
+        CompressionFormat::Zstd => {
+            let decoder = ZstdDecoder::new(reader).map_err(|e| Error::StoreCorruption {
+                message: format!("failed to create zstd decoder: {e}"),
+            })?;
+            extract_tar_archive(decoder, dest_dir)
+        }
+        CompressionFormat::Unknown => {
+            // Try gzip as fallback
+            let decoder = GzDecoder::new(reader);
+            extract_tar_archive(decoder, dest_dir)
+        }
+    }
+}
+
+fn extract_tar_archive<R: Read>(reader: R, dest_dir: &Path) -> Result<(), Error> {
+    let mut archive = Archive::new(reader);
 
     archive.set_preserve_permissions(true);
     archive.set_unpack_xattrs(true);
@@ -78,36 +146,11 @@ fn validate_path(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// Extract a tarball from a reader (assumes gzip compression).
+/// For file-based extraction with auto-detection, use `extract_tarball` instead.
 pub fn extract_tarball_from_reader<R: Read>(reader: R, dest_dir: &Path) -> Result<(), Error> {
     let decoder = GzDecoder::new(reader);
-    let mut archive = Archive::new(decoder);
-
-    archive.set_preserve_permissions(true);
-    archive.set_unpack_xattrs(true);
-
-    for entry in archive.entries().map_err(|e| Error::StoreCorruption {
-        message: format!("failed to read archive entries: {e}"),
-    })? {
-        let mut entry = entry.map_err(|e| Error::StoreCorruption {
-            message: format!("failed to read archive entry: {e}"),
-        })?;
-
-        let entry_path = entry.path().map_err(|e| Error::StoreCorruption {
-            message: format!("failed to read entry path: {e}"),
-        })?;
-
-        validate_path(&entry_path)?;
-
-        let path_display = entry_path.display().to_string();
-
-        entry
-            .unpack_in(dest_dir)
-            .map_err(|e| Error::StoreCorruption {
-                message: format!("failed to unpack entry {path_display}: {e}"),
-            })?;
-    }
-
-    Ok(())
+    extract_tar_archive(decoder, dest_dir)
 }
 
 #[cfg(test)]

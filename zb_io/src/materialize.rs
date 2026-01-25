@@ -61,7 +61,7 @@ impl Cellar {
 
         // Patch Homebrew placeholders in Mach-O binaries
         #[cfg(target_os = "macos")]
-        patch_homebrew_placeholders(&keg_path, &self.cellar_dir)?;
+        patch_homebrew_placeholders(&keg_path, &self.cellar_dir, name, version)?;
 
         // Strip quarantine xattrs and ad-hoc sign Mach-O binaries
         #[cfg(target_os = "macos")]
@@ -122,11 +122,20 @@ fn find_bottle_content(store_entry: &Path, name: &str, version: &str) -> Result<
 }
 
 /// Patch @@HOMEBREW_CELLAR@@ and @@HOMEBREW_PREFIX@@ placeholders in Mach-O binaries.
+/// Also fixes version mismatches where a bottle references a different version of itself.
 /// Uses rayon for parallel processing.
 #[cfg(target_os = "macos")]
-fn patch_homebrew_placeholders(keg_path: &Path, cellar_dir: &Path) -> Result<(), Error> {
+fn patch_homebrew_placeholders(
+    keg_path: &Path,
+    cellar_dir: &Path,
+    pkg_name: &str,
+    pkg_version: &str,
+) -> Result<(), Error> {
     use rayon::prelude::*;
+    use regex::Regex;
+    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Derive prefix from cellar (cellar_dir is typically prefix/Cellar)
     let prefix = cellar_dir.parent().unwrap_or(Path::new("/opt/homebrew"));
@@ -134,12 +143,20 @@ fn patch_homebrew_placeholders(keg_path: &Path, cellar_dir: &Path) -> Result<(),
     let cellar_str = cellar_dir.to_string_lossy().to_string();
     let prefix_str = prefix.to_string_lossy().to_string();
 
-    // Collect all Mach-O files first
+    // Regex to match version mismatches in paths like /Cellar/ffmpeg/8.0.1_1/
+    // We'll fix references to this package with wrong versions
+    let version_pattern = format!(r"(/{}/)([^/]+)(/)", regex::escape(pkg_name));
+    let version_regex = Regex::new(&version_pattern).ok();
+
+    // Collect all Mach-O files first (skip symlinks to avoid double-processing)
     let macho_files: Vec<PathBuf> = walkdir::WalkDir::new(keg_path)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file())
+        .filter(|e| {
+            // Skip symlinks - only process actual files
+            e.file_type().is_file()
+        })
         .filter(|e| {
             if let Ok(data) = fs::read(e.path()) {
                 if data.len() >= 4 {
@@ -155,63 +172,147 @@ fn patch_homebrew_placeholders(keg_path: &Path, cellar_dir: &Path) -> Result<(),
         .map(|e| e.path().to_path_buf())
         .collect();
 
-    // Process Mach-O files in parallel
-    macho_files.par_iter().for_each(|path| {
-        // Get current install names
-        let output = Command::new("otool")
-            .args(["-L", &path.to_string_lossy()])
-            .output();
+    // Track patch failures
+    let patch_failures = AtomicUsize::new(0);
 
-        let output = match output {
-            Ok(o) if o.status.success() => o,
-            _ => return,
-        };
+    // Helper to patch a single path reference
+    let patch_path = |old_path: &str| -> Option<String> {
+        let mut new_path = old_path.to_string();
+        let mut changed = false;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Replace Homebrew placeholders
+        if old_path.contains("@@HOMEBREW_CELLAR@@") || old_path.contains("@@HOMEBREW_PREFIX@@") {
+            new_path = new_path
+                .replace("@@HOMEBREW_CELLAR@@", &cellar_str)
+                .replace("@@HOMEBREW_PREFIX@@", &prefix_str);
+            changed = true;
+        }
 
-        // Find lines with placeholders and patch them
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.contains("@@HOMEBREW_CELLAR@@") || line.contains("@@HOMEBREW_PREFIX@@") {
-                // Extract the path (before the compatibility version info)
-                if let Some(old_path) = line.split_whitespace().next() {
-                    let new_path = old_path
-                        .replace("@@HOMEBREW_CELLAR@@", &cellar_str)
-                        .replace("@@HOMEBREW_PREFIX@@", &prefix_str);
-
-                    // Use install_name_tool to patch
-                    let _ = Command::new("install_name_tool")
-                        .args(["-change", old_path, &new_path, &path.to_string_lossy()])
-                        .output();
+        // Fix version mismatches for this package
+        if let Some(re) = &version_regex {
+            if re.is_match(&new_path) {
+                let replacement = format!("/{}/{}/", pkg_name, pkg_version);
+                let fixed = re.replace(&new_path, |caps: &regex::Captures| {
+                    let matched_version = &caps[2];
+                    if matched_version != pkg_version {
+                        replacement.clone()
+                    } else {
+                        caps[0].to_string()
+                    }
+                });
+                if fixed != new_path {
+                    new_path = fixed.to_string();
+                    changed = true;
                 }
             }
         }
 
-        // Also patch the ID if it has placeholders
-        let output = Command::new("otool")
-            .args(["-D", &path.to_string_lossy()])
-            .output();
+        if changed && new_path != old_path {
+            Some(new_path)
+        } else {
+            None
+        }
+    };
 
-        if let Ok(o) = output {
-            if o.status.success() {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                for line in stdout.lines().skip(1) {
-                    // Skip first line (filename)
+    // Process Mach-O files in parallel
+    macho_files.par_iter().for_each(|path| {
+        // Get file permissions and make writable if needed
+        let metadata = match fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let original_mode = metadata.permissions().mode();
+        let is_readonly = original_mode & 0o200 == 0;
+
+        // Make writable for patching
+        if is_readonly {
+            let mut perms = metadata.permissions();
+            perms.set_mode(original_mode | 0o200);
+            if fs::set_permissions(path, perms).is_err() {
+                patch_failures.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+
+        let mut patched_any = false;
+
+        // Get and patch library dependencies (-L)
+        if let Ok(output) = Command::new("otool")
+            .args(["-L", &path.to_string_lossy()])
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
                     let line = line.trim();
-                    if line.contains("@@HOMEBREW_CELLAR@@") || line.contains("@@HOMEBREW_PREFIX@@")
-                    {
-                        let new_id = line
-                            .replace("@@HOMEBREW_CELLAR@@", &cellar_str)
-                            .replace("@@HOMEBREW_PREFIX@@", &prefix_str);
-
-                        let _ = Command::new("install_name_tool")
-                            .args(["-id", &new_id, &path.to_string_lossy()])
-                            .output();
+                    if let Some(old_path) = line.split_whitespace().next() {
+                        if let Some(new_path) = patch_path(old_path) {
+                            let result = Command::new("install_name_tool")
+                                .args(["-change", old_path, &new_path, &path.to_string_lossy()])
+                                .output();
+                            if result.is_ok() {
+                                patched_any = true;
+                            } else {
+                                patch_failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     }
                 }
             }
         }
+
+        // Get and patch install name ID (-D)
+        if let Ok(output) = Command::new("otool")
+            .args(["-D", &path.to_string_lossy()])
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines().skip(1) {
+                    // Skip first line (filename)
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some(new_id) = patch_path(line) {
+                        let result = Command::new("install_name_tool")
+                            .args(["-id", &new_id, &path.to_string_lossy()])
+                            .output();
+                        if result.is_ok() {
+                            patched_any = true;
+                        } else {
+                            patch_failures.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Re-sign if we patched anything (patching invalidates code signature)
+        if patched_any {
+            let _ = Command::new("codesign")
+                .args(["--force", "--sign", "-", &path.to_string_lossy()])
+                .output();
+        }
+
+        // Restore original permissions
+        if is_readonly {
+            let mut perms = metadata.permissions();
+            perms.set_mode(original_mode);
+            let _ = fs::set_permissions(path, perms);
+        }
     });
+
+    let failures = patch_failures.load(Ordering::Relaxed);
+    if failures > 0 {
+        return Err(Error::StoreCorruption {
+            message: format!(
+                "failed to patch {} Mach-O files in {}",
+                failures,
+                keg_path.display()
+            ),
+        });
+    }
 
     Ok(())
 }
@@ -568,5 +669,61 @@ mod tests {
             fs::read_to_string(keg_path.join("bin/foo")).unwrap(),
             "#!/bin/sh\necho foo"
         );
+    }
+
+    #[test]
+    fn version_mismatch_regex_fixes_paths() {
+        use regex::Regex;
+
+        let pkg_name = "ffmpeg";
+        let pkg_version = "8.0.1_2";
+
+        // Create the version mismatch regex
+        let version_pattern = format!(r"(/{}/)([^/]+)(/)", regex::escape(pkg_name));
+        let version_regex = Regex::new(&version_pattern).unwrap();
+
+        // Test case: path with wrong version
+        let old_path = "/opt/zerobrew/prefix/Cellar/ffmpeg/8.0.1_1/lib/libavdevice.62.dylib";
+        let replacement = format!("/{}/{}/", pkg_name, pkg_version);
+
+        let fixed = version_regex.replace(old_path, |caps: &regex::Captures| {
+            let matched_version = &caps[2];
+            if matched_version != pkg_version {
+                replacement.clone()
+            } else {
+                caps[0].to_string()
+            }
+        });
+
+        assert_eq!(
+            fixed,
+            "/opt/zerobrew/prefix/Cellar/ffmpeg/8.0.1_2/lib/libavdevice.62.dylib"
+        );
+
+        // Test case: path with correct version (should not change)
+        let correct_path = "/opt/zerobrew/prefix/Cellar/ffmpeg/8.0.1_2/lib/libavdevice.62.dylib";
+        let fixed2 = version_regex.replace(correct_path, |caps: &regex::Captures| {
+            let matched_version = &caps[2];
+            if matched_version != pkg_version {
+                replacement.clone()
+            } else {
+                caps[0].to_string()
+            }
+        });
+
+        assert_eq!(fixed2, correct_path);
+
+        // Test case: path for different package (should not change)
+        let other_path = "/opt/zerobrew/prefix/Cellar/libvpx/1.0.0/lib/libvpx.dylib";
+        let fixed3 = version_regex.replace(other_path, |caps: &regex::Captures| {
+            let matched_version = &caps[2];
+            if matched_version != pkg_version {
+                replacement.clone()
+            } else {
+                caps[0].to_string()
+            }
+        });
+
+        assert_eq!(fixed3, other_path);
     }
 }
