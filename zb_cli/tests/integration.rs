@@ -3,23 +3,25 @@ use std::process::{Command, Output};
 
 struct TestEnv {
     root: tempfile::TempDir,
+    prefix: PathBuf,
 }
 
 impl TestEnv {
     fn new() -> Self {
-        Self {
-            root: tempfile::TempDir::new().expect("failed to create temp dir"),
-        }
+        let root = tempfile::TempDir::new().expect("failed to create temp dir");
+        let prefix = root.path().join("prefix");
+
+        Self { root, prefix }
     }
 
     fn zb(&self, args: &[&str]) -> Output {
         let zb = env!("CARGO_BIN_EXE_zb");
         Command::new(zb)
             .env("ZEROBREW_ROOT", self.root.path())
-            // Without this override a host-level ZEROBREW_PREFIX (from a previous `zb init`)
+	    // Without this override a host-level ZEROBREW_PREFIX (from a previous `zb init`)
             // leaks into the test, causing the cellar/linker to write outside the temp dir
             // and making integration tests fail.
-            .env("ZEROBREW_PREFIX", self.root.path().join("prefix"))
+            .env("ZEROBREW_PREFIX", self.prefix.as_path())
             .env("ZEROBREW_AUTO_INIT", "true")
             .args(args)
             .output()
@@ -27,7 +29,7 @@ impl TestEnv {
     }
 
     fn bin_dir(&self) -> PathBuf {
-        self.root.path().join("prefix").join("bin")
+        self.prefix.join("bin")
     }
 
     fn count_store_entries(&self) -> usize {

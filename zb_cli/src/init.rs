@@ -313,6 +313,7 @@ pub fn ensure_init(root: &Path, prefix: &Path, auto_init: bool) -> Result<(), zb
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
@@ -394,6 +395,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn add_to_path_writes_all_env_vars() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
@@ -437,6 +439,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn add_to_path_includes_path_append_function() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
@@ -465,6 +468,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn add_to_path_adds_both_paths() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
@@ -492,6 +496,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn add_to_path_no_modify_shell_skips_write() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
@@ -518,6 +523,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn add_to_path_no_duplicate_config() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
@@ -549,6 +555,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn add_to_path_uses_zshrc_for_zsh() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
@@ -575,6 +582,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn add_to_path_prefers_zshenv_when_exists() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
@@ -611,6 +619,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn add_to_path_uses_bash_profile_when_exists() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
@@ -644,6 +653,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn add_to_path_uses_profile_for_other_shells() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
@@ -671,6 +681,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn add_to_path_uses_zdotdir_when_set() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
